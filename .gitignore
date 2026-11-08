@@ -61,9 +61,6 @@ scripts/
 deploy/cron/
 deploy/docker/backup-cron
 
-# Documentation images (may contain screenshots with sensitive data)
-# Review before publishing individually
-docs/image/
 
 # Prisma schema backup
 prisma/schema.prisma.*.bak

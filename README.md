@@ -275,6 +275,22 @@ This project is proprietary software. All rights reserved.
 
 This is a personal/foundation project. Contributions are not accepted at this time.
 
+## Screenshots
+
+### Landing Page
+
+![Landing Page](docs/image/01.png)
+
+### Admin Dashboard
+
+![Admin Dashboard](docs/image/02.png)
+
+### Customer Portal
+
+![Customer Portal](docs/image/03.png)
+
+> More screenshots are available in the [docs/image/](docs/image/) directory.
+
 ## Support
 
 For issues and questions, please contact the project maintainer.

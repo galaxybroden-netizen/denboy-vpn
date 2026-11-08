@@ -1,0 +1,56 @@
+[Unit]
+Description=MVMP — Background worker (BullMQ)
+Documentation=file:///opt/mvmp/docs/deployment/NATIVE_UBUNTU_INSTALLATION.md
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+Requires=redis-server.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=mvmp
+Group=mvmp
+WorkingDirectory=/opt/mvmp
+EnvironmentFile=/etc/mvmp/db.env
+EnvironmentFile=/etc/mvmp/redis.env
+EnvironmentFile=/etc/mvmp/app.env
+Environment=NODE_ENV=production
+
+# Worker entry — compiled to .next/standalone/worker/index.js by build.sh
+# Uses bun (preferred) if available, else node.
+ExecStart=/usr/local/bin/bun /opt/mvmp/.next/standalone/worker/index.js
+
+# Graceful shutdown — worker closes BullMQ connections on SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits — worker is lighter than API
+MemoryHigh=512M
+MemoryMax=768M
+LimitNOFILE=65536
+TasksMax=256
+
+# Hardening (same as mvmp-api)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/mvmp /var/log/mvmp /var/run/mvmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mvmp-worker
+
+[Install]
+WantedBy=multi-user.target

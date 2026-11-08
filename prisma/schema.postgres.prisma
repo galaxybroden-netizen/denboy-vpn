@@ -1,0 +1,1409 @@
+// MVMP — Multi VPN Management Panel
+// Prisma schema (SQLite untuk sandbox; production: PostgreSQL)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============ AUTH & RBAC ============
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  // Username — distinct from email, used for login display & audit log readability
+  username      String   @unique
+  phone         String?
+  name          String
+  passwordHash  String
+  role          UserRole @default(CUSTOMER)
+  status        UserStatus @default(ACTIVE)
+  mfaEnabled    Boolean  @default(false)
+  mfaSecret     String?
+  // Recovery codes for 2FA (JSON array of hashed codes)
+  recoveryCodesJson String?
+  // Account expiry — when set, user cannot login after this date
+  expiresAt     DateTime?
+  // Security audit timestamps
+  lastLoginAt   DateTime?
+  lastPasswordChangeAt DateTime?
+  emailVerifiedAt   DateTime?
+  phoneVerifiedAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  customer      Customer?
+  reseller      Reseller?
+  auditLogs     AuditLog[]
+  notifications Notification[]
+  sessions      Session[]
+  apiKeys       ApiKey[]
+  whatsappConversations WhatsappConversation[]
+  // RBAC: custom per-user permission overrides (additions or removals)
+  userPermissions  UserPermission[]
+  otpCodes         OtpCode[]
+  userDevices      UserDevice[]
+  // Optional link to Role record (when DB-backed RBAC is configured).
+  // Falls back to enum `role` field above when null (backwards compat).
+  // Named `roleRecord` to avoid clashing with the `role` enum scalar field.
+  roleId           String?
+  roleRecord       Role?     @relation("roleRecord", fields: [roleId], references: [id], onDelete: SetNull)
+
+  @@index([role])
+  @@index([status])
+  @@index([username])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  token        String   @unique
+  ipAddress    String?
+  userAgent    String?
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime @default(now())
+
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ============ VPS INFRASTRUCTURE ============
+
+model ServerGroup {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+
+  servers     Server[]
+}
+
+model Server {
+  id              String   @id @default(cuid())
+  groupId         String?
+  name            String
+  hostname        String
+  publicIp        String
+  privateIp       String?
+  sshPort         Int      @default(22)
+  region          String
+  countryCode     String
+  osName          String   @default("Ubuntu")
+  osVersion       String   @default("22.04 LTS")
+  architecture    String   @default("x86_64")
+  kernelVersion   String?
+  firewallBackend String   @default("ufw")
+  cpuCores        Int
+  ramTotalBytes   BigInt
+  diskTotalBytes  BigInt
+  maxAccounts     Int      @default(100)
+  status          ServerStatus @default(PENDING)
+  maintenanceMode Boolean  @default(false)
+  lastSeenAt      DateTime?
+  provider        String   @default("OVH")
+  monthlyCost     Float
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  group           ServerGroup?   @relation(fields: [groupId], references: [id])
+  agent           ServerAgent?
+  protocols       ServerProtocol[]
+  vpnAccounts     VpnAccount[]
+  metrics         ServerMetric[]
+  jobs            Job[]
+  firewallRules   FirewallRule[]
+  serverPorts     ServerPort[]
+
+  @@index([status])
+  @@index([region])
+  @@index([groupId])
+}
+
+model ServerAgent {
+  id                    String   @id @default(cuid())
+  serverId              String   @unique
+  agentId               String   @unique
+  certificateSerial     String?
+  certificateFingerprint String?
+  agentVersion          String   @default("1.0.0")
+  status                AgentStatus @default(OFFLINE)
+  lastHeartbeatAt       DateTime?
+  registeredAt          DateTime @default(now())
+  revokedAt             DateTime?
+
+  server                Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+}
+
+model Protocol {
+  id           String   @id @default(cuid())
+  key          String   @unique
+  displayName  String
+  engine       String
+  description  String?
+  isEnabled    Boolean  @default(true)
+  isPremium    Boolean  @default(false)
+
+  serverProtocols ServerProtocol[]
+  vpnAccounts     VpnAccount[]
+  packages        PackageProtocol[]
+  serverPorts     ServerPort[]
+}
+
+model ServerProtocol {
+  id              String   @id @default(cuid())
+  serverId        String
+  protocolId      String
+  engineVersion   String?
+  status          ProtocolStatus @default(NOT_INSTALLED)
+  installedAt     DateTime?
+  lastCheckedAt   DateTime?
+  port            Int?
+  transport       String?
+
+  server          Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  protocol        Protocol @relation(fields: [protocolId], references: [id])
+
+  @@unique([serverId, protocolId])
+  @@index([status])
+}
+
+model ServerPort {
+  id          String   @id @default(cuid())
+  serverId    String
+  protocolId  String?
+  port        Int
+  transport   String
+  purpose     String?
+  status      String   @default("RESERVED")
+  reservedBy  String?
+  createdAt   DateTime @default(now())
+
+  server      Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  protocol    Protocol? @relation(fields: [protocolId], references: [id])
+
+  @@unique([serverId, port, transport])
+}
+
+model FirewallRule {
+  id          String   @id @default(cuid())
+  serverId    String
+  direction   String
+  protocol    String
+  portStart   Int
+  portEnd     Int
+  sourceCidr  String?
+  action      String
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  server      Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+}
+
+// ============ VPN ACCOUNTS ============
+
+model VpnAccount {
+  id              String   @id @default(cuid())
+  customerId      String
+  subscriptionId  String?
+  serverId        String
+  protocolId      String
+  username        String
+  externalId      String?
+  status          VpnAccountStatus @default(PENDING)
+  quotaBytes      BigInt?
+  uploadBytes     BigInt   @default(0)
+  downloadBytes   BigInt   @default(0)
+  expiresAt       DateTime?
+  maxDevices      Int      @default(3)
+  provisionedAt   DateTime?
+  revokedAt       DateTime?
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  customer        Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  subscription    Subscription? @relation(fields: [subscriptionId], references: [id])
+  server          Server   @relation(fields: [serverId], references: [id])
+  protocol        Protocol @relation(fields: [protocolId], references: [id])
+  credentials     VpnCredential[]
+  usage           VpnUsage[]
+
+  @@index([customerId])
+  @@index([serverId])
+  @@index([status])
+}
+
+model VpnCredential {
+  id              String   @id @default(cuid())
+  vpnAccountId    String
+  credentialType  String
+  secretEncrypted String
+  publicValue     String?
+  keyVersion      String   @default("v1")
+  shownOnceAt     DateTime?
+  createdAt       DateTime @default(now())
+  rotatedAt       DateTime?
+
+  vpnAccount      VpnAccount @relation(fields: [vpnAccountId], references: [id], onDelete: Cascade)
+}
+
+model VpnUsage {
+  id              String   @id @default(cuid())
+  vpnAccountId    String
+  serverId        String?
+  uploadBytes     BigInt
+  downloadBytes   BigInt
+  totalBytes      BigInt
+  source          String
+  counterEpoch    String?
+  recordedAt      DateTime @default(now())
+
+  vpnAccount      VpnAccount @relation(fields: [vpnAccountId], references: [id], onDelete: Cascade)
+
+  @@index([vpnAccountId])
+  @@index([recordedAt])
+}
+
+// ============ CUSTOMER & RESELLER ============
+
+model Customer {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  resellerId    String?
+  customerCode  String   @unique
+  name          String
+  email         String
+  phone         String?
+  status        String   @default("ACTIVE")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reseller      Reseller? @relation(fields: [resellerId], references: [id])
+  vpnAccounts   VpnAccount[]
+  subscriptions Subscription[]
+  transactions  Transaction[]
+
+  @@index([resellerId])
+}
+
+model Reseller {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  resellerCode    String   @unique
+  parentResellerId String?
+  status          String   @default("ACTIVE")
+  commissionRate  Float    @default(10)
+  accountLimit    Int      @default(50)
+  balance         Float    @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parentReseller  Reseller? @relation("ResellerHierarchy", fields: [parentResellerId], references: [id])
+  children        Reseller[] @relation("ResellerHierarchy")
+  customers       Customer[]
+  ledger          ResellerLedger[]
+  commissions     ResellerCommission[]
+  transactions    Transaction[]
+
+  @@index([parentResellerId])
+}
+
+model ResellerLedger {
+  id            String   @id @default(cuid())
+  resellerId    String
+  transactionId String?
+  entryType     String
+  amount        Float
+  balanceAfter  Float
+  reference     String?
+  description   String?
+  createdAt     DateTime @default(now())
+
+  reseller      Reseller @relation(fields: [resellerId], references: [id], onDelete: Cascade)
+
+  @@index([resellerId])
+}
+
+model ResellerCommission {
+  id            String   @id @default(cuid())
+  resellerId    String
+  transactionId String
+  amount        Float
+  status        String   @default("PENDING")
+  createdAt     DateTime @default(now())
+  paidAt        DateTime?
+
+  reseller      Reseller   @relation(fields: [resellerId], references: [id], onDelete: Cascade)
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+}
+
+// ============ PACKAGES & SUBSCRIPTIONS ============
+
+model Package {
+  id              String   @id @default(cuid())
+  name            String
+  description     String?
+  price           Float
+  currency        String   @default("IDR")
+  durationDays    Int
+  quotaBytes      BigInt?
+  maxDevices      Int      @default(3)
+  allocationPolicy String?
+  status          String   @default("ACTIVE")
+  isFeatured      Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  protocols       PackageProtocol[]
+  subscriptions   Subscription[]
+  transactions    Transaction[]
+
+  @@index([status])
+}
+
+model PackageProtocol {
+  packageId   String
+  protocolId  String
+
+  package     Package  @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  protocol    Protocol @relation(fields: [protocolId], references: [id])
+
+  @@id([packageId, protocolId])
+}
+
+model Subscription {
+  id            String   @id @default(cuid())
+  customerId    String
+  packageId     String
+  status        String   @default("ACTIVE")
+  startsAt      DateTime
+  expiresAt     DateTime
+  quotaBytes    BigInt?
+  createdAt     DateTime @default(now())
+
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  package       Package  @relation(fields: [packageId], references: [id])
+  vpnAccounts   VpnAccount[]
+
+  @@index([customerId])
+  @@index([status])
+}
+
+// ============ TRANSACTIONS & PAYMENTS ============
+
+model Transaction {
+  id              String   @id @default(cuid())
+  customerId      String
+  resellerId      String?
+  packageId       String?
+  serverId        String?
+  invoiceNumber   String   @unique
+  type            String   @default("PURCHASE")
+  amount          Float
+  currency        String   @default("IDR")
+  status          TransactionStatus @default(PENDING)
+  idempotencyKey  String   @unique
+  paidAt          DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  customer        Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  reseller        Reseller? @relation(fields: [resellerId], references: [id])
+  package         Package? @relation(fields: [packageId], references: [id])
+  payments        Payment[]
+  commissions     ResellerCommission[]
+  invoice         Invoice?
+
+  @@index([customerId])
+  @@index([status])
+  @@index([packageId])
+}
+
+model Payment {
+  id                String   @id @default(cuid())
+  transactionId     String
+  provider          String   @default("MANUAL")
+  providerReference String?
+  paymentMethod     String
+  amount            Float
+  currency          String   @default("IDR")
+  status            PaymentStatus @default(PENDING)
+  paidAt            DateTime?
+  expiresAt         DateTime?
+  qrisData          String?
+  vaNumber          String?
+  createdAt         DateTime @default(now())
+
+  transaction       Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  manualProofs      ManualPaymentProof[]
+
+  @@index([status])
+  @@index([transactionId])
+}
+
+model ManualPaymentProof {
+  id            String   @id @default(cuid())
+  paymentId     String
+  fileReference String
+  fileName      String?
+  submittedAt   DateTime @default(now())
+  reviewedBy    String?
+  reviewedAt    DateTime?
+  reviewStatus  String   @default("PENDING")
+  reviewNote    String?
+
+  payment       Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+}
+
+model Invoice {
+  id              String   @id @default(cuid())
+  transactionId   String   @unique
+  invoiceNumber   String   @unique
+  fileReference   String?
+  issuedAt        DateTime @default(now())
+  dueAt           DateTime?
+
+  transaction     Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+}
+
+// ============ JOBS & MONITORING ============
+
+model Job {
+  id              String   @id @default(cuid())
+  serverId        String
+  jobType         String
+  payload         String
+  payloadHash     String?
+  idempotencyKey  String   @unique
+  status          JobStatus @default(QUEUED)
+  priority        Int      @default(5)
+  result          String?
+  errorCode       String?
+  errorMessage    String?
+  expiresAt       DateTime?
+  createdAt       DateTime @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  server          Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  logs            JobLog[]
+
+  @@index([status])
+  @@index([serverId])
+}
+
+model JobLog {
+  id          String   @id @default(cuid())
+  jobId       String
+  level       String
+  message     String
+  createdAt   DateTime @default(now())
+
+  job         Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+}
+
+model ServerMetric {
+  id              String   @id @default(cuid())
+  serverId        String
+  cpuPercent      Float
+  ramUsedBytes    BigInt
+  diskUsedBytes   BigInt
+  networkRxBytes  BigInt
+  networkTxBytes  BigInt
+  loadAverage     String?
+  activeAccounts  Int      @default(0)
+  bandwidthMbps   Float    @default(0)
+  recordedAt      DateTime @default(now())
+
+  server          Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@index([serverId])
+  @@index([recordedAt])
+}
+
+// ============ SECURITY & OPS ============
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  actorUserId   String?
+  actorType     String   @default("USER")
+  action        String
+  resourceType  String?
+  resourceId    String?
+  ipAddress     String?
+  userAgent     String?
+  metadata      String?
+  createdAt     DateTime @default(now())
+
+  user          User?    @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([action])
+  @@index([resourceType])
+  @@index([createdAt])
+}
+
+model Notification {
+  id          String   @id @default(cuid())
+  userId      String
+  type        String
+  title       String
+  body        String?
+  data        String?
+  readAt      DateTime?
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([readAt])
+}
+
+// ============ API KEYS (untuk integrasi eksternal) ============
+
+model ApiKey {
+  id            String   @id @default(cuid())
+  userId        String
+  name          String
+  keyHash       String   @unique
+  keyPrefix     String   @unique
+  scopes        String   @default("[]")
+  lastUsedAt    DateTime?
+  expiresAt     DateTime?
+  createdAt     DateTime @default(now())
+  revokedAt     DateTime?
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([keyPrefix])
+}
+
+// ============ EMAIL LOG (mock SMTP — riwayat email notifikasi) ============
+
+model EmailLog {
+  id          String   @id @default(cuid())
+  toEmail     String
+  subject     String
+  body        String
+  template    String   @default("GENERIC") // WELCOME_ACCOUNT | PAYMENT_RECEIPT | EXPIRY_WARNING | GENERIC
+  status      String   @default("SENT") // SENT | FAILED
+  relatedType String?
+  relatedId   String?
+  createdAt   DateTime @default(now())
+
+  @@index([template])
+  @@index([createdAt])
+  @@index([relatedId])
+}
+
+// ============ RBAC: ROLE & PERMISSION (DB-backed, complements ROLE_PERMISSIONS const) ============
+
+model Role {
+  id          String   @id @default(cuid())
+  // Matches UserRole enum value (SUPER_ADMIN, ADMIN, OPERATOR, FINANCE, etc.)
+  key         String   @unique
+  name        String
+  description String?
+  isSystem    Boolean  @default(false)  // System roles cannot be deleted
+  // Color for UI badge (e.g. "rose" for SUPER_ADMIN, "emerald" for ADMIN)
+  color       String   @default("zinc")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rolePermissions RolePermission[]
+  users           User[]    @relation("roleRecord")
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  // Dot-notation key, e.g. "servers.view", "vpn_accounts.delete", "whatsapp.broadcast.send"
+  key         String   @unique
+  name        String
+  description String?
+  // Grouping for UI matrix: "Operasional", "Infrastruktur", "Pengguna", "Bisnis", "WhatsApp", "Sistem", "Settings", "Sensitive Actions"
+  category    String
+  // Action type: view, create, read, update, delete, export, manage, send, restart, etc.
+  action      String
+  // Whether this is a sensitive action requiring extra confirmation (restart VPS, delete VPN account, broadcast, etc.)
+  isSensitive Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  rolePermissions RolePermission[]
+  userPermissions  UserPermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+}
+
+model UserPermission {
+  id          String   @id @default(cuid())
+  userId      String
+  permissionId String
+  // "GRANT" = explicitly add this permission to user (overrides role denial)
+  // "DENY" = explicitly remove this permission from user (overrides role grant)
+  mode        String   @default("GRANT")
+  createdBy   String?
+  createdAt   DateTime @default(now())
+
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission  Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, permissionId])
+  @@index([userId])
+}
+
+// ============ OTP & SECURITY ============
+
+model OtpCode {
+  id          String   @id @default(cuid())
+  userId      String
+  // Purpose: "password_change", "email_verify", "phone_verify", "sensitive_action"
+  purpose     String
+  // Hashed OTP — never store plaintext
+  codeHash    String
+  // Channel: "email" or "phone"
+  channel     String
+  // Where it was sent (email address or phone, for audit/display)
+  sentTo      String
+  expiresAt   DateTime
+  // Track usage — single-use only
+  usedAt      DateTime?
+  // Rate limiting: track attempts to verify
+  attempts    Int      @default(0)
+  maxAttempts Int      @default(5)
+  // Track request IP for abuse detection
+  requestedIp String?
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+}
+
+model UserDevice {
+  id          String   @id @default(cuid())
+  userId      String
+  // Friendly name (browser + OS, e.g. "Chrome on Windows")
+  deviceName  String
+  userAgent   String?
+  ipAddress   String?
+  // Location approximation (country/city) — null if not available
+  location    String?
+  lastSeenAt  DateTime @default(now())
+  // When set, device is revoked (cannot be used for new sessions)
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ============ SYSTEM SETTINGS (key-value store) ============
+
+model SystemSetting {
+  id          String   @id @default(cuid())
+  // Namespaced key: "app.name", "app.logo_url", "company.email", "smtp.host",
+  // "theme.primary_color", "portal.customer_logo_url", "security.otp_expiry_minutes"
+  key         String   @unique
+  // JSON-encoded value (string, number, boolean, object)
+  value       String
+  // Whether this value contains sensitive data (SMTP password, API secret) — frontend cannot read these
+  isSensitive Boolean  @default(false)
+  // Category for grouping in UI: "branding", "general", "smtp", "security", "portal", etc.
+  category    String   @default("general")
+  updatedAt   DateTime @updatedAt
+  updatedBy   String?
+
+  @@index([category])
+}
+
+// ============ AI CENTER — Multi-Provider AI Engine ============
+
+model AIProvider {
+  id              String   @id @default(cuid())
+  name            String   @unique  // "OpenAI", "Anthropic", "Gemini", "Ollama", etc.
+  type            String   // "cloud" | "local" | "coding_agent"
+  baseUrl         String   // "https://api.openai.com/v1", "http://localhost:11434"
+  apiKeyEncrypted String?  // encrypted — never sent to frontend
+  apiKeyPrefix    String?  // first 4 + last 4 chars for display (e.g. "sk-x••••••1234")
+  orgId           String?  // organization/project ID (OpenAI org, Anthropic version, etc.)
+  apiVersion      String?  // API version if needed
+  authType        String   @default("bearer") // "bearer" | "x-api-key" | "query" | "none"
+  timeout         Int      @default(30)  // seconds
+  retryCount      Int      @default(2)
+  rateLimitPerMin Int      @default(60)
+  priority        Int      @default(100)  // lower = higher priority for routing
+  isActive        Boolean  @default(false)
+  lastConnectedAt DateTime?
+  lastError       String?
+  // Metadata JSON: { supportedFeatures: ["chat","completion","embedding"], limits: {...} }
+  metadataJson    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  models    AIModel[]
+  usage     AIUsage[]
+  credentials AICredential[]
+}
+
+model AIModel {
+  id              String   @id @default(cuid())
+  providerId      String
+  modelId         String   // "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash", "llama3.2"
+  displayName     String   // "GPT-4o", "Claude Sonnet 4", etc.
+  description     String?
+  category        String   // "free" | "free_local" | "paid" | "premium" | "reasoning" | "coding" | "fast" | "multimodal" | "custom"
+  contextWindow   Int      @default(4096)   // max input tokens
+  maxOutputTokens Int      @default(2048)   // max output tokens
+  inputPricePer1M Float    @default(0)      // USD per 1M input tokens (0 = free)
+  outputPricePer1M Float   @default(0)      // USD per 1M output tokens
+  currency        String   @default("USD")
+  isFree          Boolean  @default(false)
+  capabilities    String?  // JSON: ["chat","vision","function_calling","code"]
+  defaultTemp     Float    @default(0.7)
+  defaultMaxTokens Int     @default(2048)
+  rateLimitPerMin Int      @default(60)
+  recommendedUse  String?  // "chatbot" | "agent" | "reasoning" | "coding" | "fast_reply"
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  provider        AIProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  usage           AIUsage[]
+}
+
+model AICredential {
+  id              String   @id @default(cuid())
+  providerId      String
+  label           String   // "Production Key", "Sandbox Key"
+  keyEncrypted    String   // encrypted API key
+  keyPrefix       String?  // masked for display
+  isActive        Boolean  @default(true)
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  provider        AIProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+}
+
+model AIConfiguration {
+  id              String   @id @default(cuid())
+  // Single-row config (singleton)
+  // Routing mode: "free_first" | "cheapest_first" | "performance_first" | "quality_first" | "manual"
+  routingMode     String   @default("free_first")
+  defaultModelId  String?  // fallback model
+  chatbotModelId  String?  // model for customer chatbot
+  agentModelId    String?  // model for admin AI agent
+  reasoningModelId String? // model for complex reasoning
+  codingModelId   String?  // model for code generation
+  fallbackModelId String?  // last resort fallback
+  // Cost control
+  dailyBudgetUsd  Float    @default(10)
+  monthlyBudgetUsd Float   @default(300)
+  maxCostPerRequestUsd Float @default(0.5)
+  maxCostPerUserUsd Float  @default(5)
+  tokenQuotaDaily Int      @default(1000000)
+  requestQuotaDaily Int    @default(5000)
+  // Global chatbot switch
+  chatbotEnabled  Boolean  @default(true)
+  agentEnabled    Boolean  @default(false)  // AI Agent for admin — off by default
+  // Temperature/defaults
+  defaultTemperature Float  @default(0.7)
+  defaultMaxTokens  Int     @default(2048)
+  streamingEnabled  Boolean @default(true)
+  // Emergency shutdown
+  emergencyShutdown Boolean @default(false)
+  // Data redaction
+  redactPII        Boolean @default(true)  // redact personally identifiable info before sending to provider
+  redactCredentials Boolean @default(true)
+  updatedAt       DateTime @updatedAt
+  updatedBy       String?
+}
+
+model AIUsage {
+  id              String   @id @default(cuid())
+  providerId      String?
+  modelId         String?
+  // "chatbot_landing" | "chatbot_customer" | "chatbot_reseller" | "agent" | "reply_assist" | "embedding"
+  feature         String
+  userId          String?  // who triggered the request
+  conversationId  String?  // link to ChatConversation
+  inputTokens     Int      @default(0)
+  outputTokens    Int      @default(0)
+  costUsd         Float    @default(0)
+  latencyMs       Int      @default(0)
+  status          String   @default("success") // "success" | "error" | "timeout" | "fallback"
+  errorMessage    String?
+  createdAt       DateTime @default(now())
+
+  provider        AIProvider? @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  model           AIModel?    @relation(fields: [modelId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([feature])
+  @@index([userId])
+  @@index([providerId, modelId])
+}
+
+model AIBudget {
+  id              String   @id @default(cuid())
+  // Period: "daily" | "monthly"
+  period          String
+  periodStart     DateTime
+  periodEnd       DateTime
+  budgetUsd       Float
+  spentUsd        Float    @default(0)
+  tokenUsed       Int      @default(0)
+  requestCount    Int      @default(0)
+  alertThreshold  Float    @default(0.8)  // alert at 80%
+  alertSentAt     DateTime?
+  hardLimitHit    Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([period, periodStart])
+  @@index([period])
+}
+
+// ============ AI AGENT (Admin Assistant) ============
+
+model AIAgent {
+  id              String   @id @default(cuid())
+  // Single-row config
+  systemPrompt    String   // system prompt for AI agent
+  allowedTools    String   // JSON array of tool keys the agent can use
+  permissionLevel String   @default("read_only") // "read_only" | "recommend" | "execute_with_approval" | "restricted"
+  isActive        Boolean  @default(false)
+  // Rate limiting
+  maxRequestsPerHour Int   @default(100)
+  lastRequestAt   DateTime?
+  updatedAt       DateTime @updatedAt
+}
+
+model AIAgentTool {
+  id              String   @id @default(cuid())
+  key             String   @unique  // "server.status", "vpn.search", "payment.analyze"
+  name            String
+  description     String?
+  category        String   // "infrastructure" | "vpn" | "admin" | "security"
+  // Permission level required to use this tool
+  requiredPermission String @default("read_only")
+  // Input schema JSON: { fields: [{name, type, required, description}] }
+  inputSchema     String
+  // Whether this tool modifies data (requires approval)
+  isDestructive   Boolean  @default(false)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+}
+
+model AIExecution {
+  id              String   @id @default(cuid())
+  agentId         String?  // link to AIAgent (nullable for direct executions)
+  userId          String   // admin who triggered
+  toolKey         String   // which tool was used
+  inputJson       String   // JSON input parameters
+  outputJson      String?  // JSON result (null if pending)
+  status          String   @default("pending") // "pending" | "approved" | "executing" | "success" | "failed" | "rejected"
+  // For approval workflow
+  requiresApproval Boolean @default(false)
+  approvedBy      String?
+  approvedAt      DateTime?
+  rejectedBy      String?
+  rejectedAt      DateTime?
+  rejectionReason String?
+  // Impact + risk assessment
+  impactSummary   String?
+  riskLevel       String?  // "low" | "medium" | "high" | "critical"
+  rollbackPlan    String?
+  errorMessage    String?
+  createdAt       DateTime @default(now())
+  executedAt      DateTime?
+
+  @@index([status])
+  @@index([userId])
+  @@index([toolKey])
+}
+
+// ============ KNOWLEDGE BASE (RAG) ============
+
+model AIKnowledgeDocument {
+  id              String   @id @default(cuid())
+  title           String
+  category        String   // "faq" | "product" | "protocol" | "troubleshooting" | "pricing" | "policy" | "reseller" | "article"
+  content         String   // full text content
+  sourceType      String   @default("manual") // "manual" | "upload" | "url"
+  sourceUrl       String?
+  fileName        String?
+  // For RAG: chunks are stored in AIKnowledgeChunk
+  chunkCount      Int      @default(0)
+  // Access control: which channels/roles can see this document
+  visibilityJson  String?  // JSON: { channels: ["landing","customer"], roles: ["CUSTOMER","RESELLER"] }
+  isActive        Boolean  @default(true)
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  chunks          AIKnowledgeChunk[]
+}
+
+model AIKnowledgeChunk {
+  id              String   @id @default(cuid())
+  documentId      String
+  chunkIndex      Int
+  content         String   // chunk text (e.g. 500 chars)
+  // Simple keyword index (production: use vector embeddings)
+  keywords        String?  // space-separated keywords for simple search
+  embedding       String?  // vector embedding (base64) — null in sandbox
+  createdAt       DateTime @default(now())
+
+  document        AIKnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([keywords])
+}
+
+// ============ PROMPT MANAGEMENT ============
+
+model AIPrompt {
+  id              String   @id @default(cuid())
+  key             String   @unique  // "global_system", "chatbot_landing", "chatbot_customer", "agent_admin", "reply_assist"
+  name            String
+  description     String?
+  currentVersionId String?  // link to AIPromptVersion (published)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  versions        AIPromptVersion[]
+}
+
+model AIPromptVersion {
+  id              String   @id @default(cuid())
+  promptId        String
+  version         Int      @default(1)
+  content         String   // the prompt text
+  modelId         String?  // recommended model for this prompt
+  temperature     Float    @default(0.7)
+  maxTokens       Int      @default(2048)
+  status          String   @default("draft") // "draft" | "published" | "archived"
+  publishedAt     DateTime?
+  publishedBy     String?
+  testResponse    String?  // last test response preview
+  createdAt       DateTime @default(now())
+
+  prompt          AIPrompt  @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  @@index([promptId])
+  @@index([status])
+}
+
+// ============ OMNICHANNEL CHAT CONVERSATION ============
+// Channel-agnostic — supports landing page, customer portal, reseller portal, WhatsApp
+
+model ChatConversation {
+  id              String   @id @default(cuid())
+  // Channel: "landing" | "customer" | "reseller" | "whatsapp" | "admin"
+  channel         String
+  // External reference (WhatsApp conversation ID, session ID for anonymous landing visitors)
+  externalRef     String?
+  // User info (nullable for anonymous landing page visitors)
+  userId          String?  // authenticated user (customer/reseller)
+  visitorName     String?  // for anonymous visitors
+  visitorEmail    String?
+  visitorPhone    String?
+  // AI control state
+  status          String   @default("AI_ACTIVE") // "AI_ACTIVE" | "HUMAN_ASSIGNED" | "AI_ASSIST" | "WAITING_FOR_ADMIN" | "RESOLVED" | "CLOSED"
+  assignedAdminId String?  // admin who took over
+  // AI context
+  aiContextJson   String?  // JSON: { intent, sentiment, urgency, summary }
+  // Tags for categorization
+  tagsJson        String?  // JSON array of strings
+  // Internal notes (admin-only)
+  internalNotes   String?
+  // Stats
+  messageCount    Int      @default(0)
+  aiMessageCount  Int      @default(0)
+  humanMessageCount Int    @default(0)
+  lastMessageAt   DateTime?
+  lastMessagePreview String?
+  lastMessageDirection String? // "IN" or "OUT" — direction of the most recent message
+  // Conversation lock for anti-double-reply
+  lockedBy        String?  // admin ID who's currently typing
+  lockedAt        DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  messages        ChatMessage[]
+  assignments     ChatAssignment[]
+  suggestedReplies ChatSuggestedReply[]
+  auditLogs       ChatAuditLog[]
+
+  @@index([status])
+  @@index([channel])
+  @@index([userId])
+  @@index([assignedAdminId])
+}
+
+model ChatMessage {
+  id              String   @id @default(cuid())
+  conversationId  String
+  // "user" | "bot" | "admin" | "system"
+  sender          String
+  senderId        String?  // user/admin ID (null for bot/system)
+  senderName      String?
+  content         String
+  // Metadata: which AI model generated this, confidence, etc.
+  metadataJson    String?
+  // Processing status (for anti-double-reply)
+  status          String   @default("sent") // "processing" | "sent" | "failed" | "cancelled"
+  // Idempotency key to prevent duplicate sends
+  idempotencyKey  String?  @unique
+  createdAt       DateTime @default(now())
+
+  conversation    ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([createdAt])
+  @@index([status])
+}
+
+model ChatAssignment {
+  id              String   @id @default(cuid())
+  conversationId  String
+  adminId         String   // admin user ID
+  // "assigned" | "unassigned" | "transferred"
+  action          String
+  assignedBy      String?  // who made the assignment (self-takeover or another admin)
+  reason          String?
+  createdAt       DateTime @default(now())
+
+  conversation    ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([adminId])
+}
+
+model ChatSuggestedReply {
+  id              String   @id @default(cuid())
+  conversationId  String
+  // 3 suggested replies generated by AI
+  replyIndex      Int      // 0, 1, or 2
+  content         String   // suggested reply text
+  style           String   // "short" | "professional" | "detailed"
+  // "pending" | "used" | "edited" | "ignored" | "regenerated"
+  status          String   @default("pending")
+  modelId         String?  // which AI model generated this
+  usedBy          String?  // admin who used/edited it
+  usedAt          DateTime?
+  createdAt       DateTime @default(now())
+
+  conversation    ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([status])
+}
+
+model ChatAuditLog {
+  id              String   @id @default(cuid())
+  conversationId  String
+  // "mode_change" | "takeover" | "return_to_ai" | "ai_reply_sent" | "human_reply_sent" | "close" | "reopen"
+  action          String
+  fromStatus      String?
+  toStatus        String?
+  actorId         String?  // admin or system
+  actorType       String   // "admin" | "ai" | "system"
+  metadataJson    String?
+  createdAt       DateTime @default(now())
+
+  conversation    ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// ============ ENUMS ============
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  OPERATOR
+  FINANCE
+  CUSTOMER_SERVICE
+  RESELLER
+  CUSTOMER
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  INVITED
+  PENDING_VERIFICATION
+  DELETED
+}
+
+enum ServerStatus {
+  PENDING
+  ONLINE
+  OFFLINE
+  DECOMMISSIONED
+  ERROR
+}
+
+enum AgentStatus {
+  ONLINE
+  OFFLINE
+  DEGRADED
+  UNAUTHORIZED
+}
+
+enum ProtocolStatus {
+  NOT_INSTALLED
+  INSTALLING
+  INSTALLED
+  RUNNING
+  STOPPED
+  ERROR
+  UNINSTALLING
+}
+
+enum VpnAccountStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+  DEPLETED
+  REVOKED
+  ERROR
+}
+
+enum TransactionStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+  CANCELLED
+  REFUNDED
+  REVIEW_REQUIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+  CANCELLED
+  REFUNDED
+  REVIEW_REQUIRED
+}
+
+enum JobStatus {
+  QUEUED
+  PROCESSING
+  SUCCESS
+  FAILED
+  EXPIRED
+  CANCELLED
+}
+
+// ============ WHATSAPP MODULE (SaaS-grade) ============
+// Tracks integration config (3 providers), synced contacts, conversations,
+// messages, templates, broadcasts, and quick replies.
+
+model WhatsappIntegration {
+  id              String   @id @default(cuid())
+  // Provider: "meta_cloud" (official WA Business API), "baileys" (unofficial WA Web via QR),
+  // or "api" (generic third-party like Fonnte/Wapanels)
+  provider        String   @default("baileys")
+  // Status: "disconnected" | "connecting" | "connected" | "error"
+  status          String   @default("disconnected")
+  // Phone number of the connected WA account (JID format like 62xxx@s.whatsapp.net for Baileys)
+  phoneNumber     String?
+  displayName     String?
+  // Credentials (encrypted at rest in production; plaintext OK for MVP sandbox)
+  // - Meta Cloud: { wabaId, phoneNumberId, accessToken, appId }
+  // - Baileys: { sessionId, qrCodeData, sessionCredsPath }
+  // - API: { apiUrl, apiKey, senderNumber }
+  credentialsJson String?
+  // Last QR code data URI (for Baileys pairing) — cleared after pairing succeeds
+  qrCodeData      String?
+  lastConnectedAt DateTime?
+  lastError       String?
+  // Auto-reply rules: array of { keyword, response, isActive }
+  autoReplyRulesJson String?
+  // Default settings
+  defaultTemplateId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model WhatsappContact {
+  id          String   @id @default(cuid())
+  // Normalized phone number (E.164 without +, e.g. 6281234567890)
+  phoneNumber String   @unique
+  displayName String
+  avatarUrl   String?
+  // Source: "CUSTOMER" (synced from Customer table), "USER" (admin/reseller), "MANUAL"
+  source      String   @default("MANUAL")
+  sourceId    String?  // customer.id or user.id
+  tags        String?  // JSON array of strings
+  lastSeenAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  conversations WhatsappConversation[]
+  broadcastRecipients WhatsappBroadcastRecipient[]
+}
+
+model WhatsappConversation {
+  id            String   @id @default(cuid())
+  contactId     String
+  // Assignee: which admin/user is handling this conversation
+  assigneeId    String?
+  status        String   @default("OPEN")  // OPEN | PENDING | RESOLVED | SPAM
+  unreadCount   Int      @default(0)
+  lastMessageAt DateTime?
+  lastMessagePreview String?  // truncated last message body
+  lastMessageDirection String? // "IN" or "OUT"
+  // Tags for categorization (e.g. "billing", "support", "sales")
+  tagsJson      String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  contact       WhatsappContact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  assignee      User?           @relation(fields: [assigneeId], references: [id], onDelete: SetNull)
+  messages      WhatsappMessage[]
+
+  @@index([status])
+  @@index([assigneeId])
+}
+
+model WhatsappMessage {
+  id              String   @id @default(cuid())
+  conversationId  String
+  // IN = received from customer, OUT = sent by us
+  direction       String
+  // TEXT, IMAGE, DOCUMENT, TEMPLATE, AUDIO, VIDEO
+  type            String   @default("TEXT")
+  body            String
+  // Media URL (if type != TEXT)
+  mediaUrl        String?
+  // Status for OUT messages: PENDING | SENT | DELIVERED | READ | FAILED
+  // For IN messages: RECEIVED
+  status          String   @default("PENDING")
+  // If sent via template, link to template
+  templateId      String?
+  // Metadata: error message, provider message ID, etc.
+  metadataJson    String?
+  sentAt          DateTime?
+  deliveredAt     DateTime?
+  readAt          DateTime?
+  createdAt       DateTime @default(now())
+
+  conversation    WhatsappConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model WhatsappTemplate {
+  id          String   @id @default(cuid())
+  // Unique key for programmatic use (e.g. "payment_success", "expiry_warning")
+  key         String   @unique
+  name        String
+  // Category: PAYMENT_SUCCESS, PAYMENT_REMINDER, MAINTENANCE, PURCHASE_CONFIRMATION,
+  // EXPIRY_WARNING, OTP, WELCOME, CUSTOM
+  category    String
+  language    String   @default("id")
+  // Body with variables: {{customer_name}}, {{invoice_number}}, {{amount}},
+  // {{login_link}}, {{username}}, {{password}}, {{expires_at}}, {{server_name}}
+  body        String
+  // List of variable names used (auto-extracted, JSON array)
+  variablesJson String?
+  // DRAFT (internal) | APPROVED (ready to use, also submitted to Meta for Cloud API approval)
+  status      String   @default("APPROVED")
+  // For Meta Cloud API: the template ID returned by Meta after approval
+  metaTemplateId String?
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  broadcasts  WhatsappBroadcast[]
+}
+
+model WhatsappBroadcast {
+  id            String   @id @default(cuid())
+  name          String
+  templateId    String
+  // Audience filter: JSON like { tags: ["vip"], customerStatus: "ACTIVE", hasUnpaidTx: true }
+  audienceFilterJson String?
+  // Computed audience count (cached at send time)
+  audienceCount Int      @default(0)
+  // Custom variables override (JSON) for this broadcast
+  variablesJson String?
+  status        String   @default("DRAFT")  // DRAFT | QUEUED | SENDING | COMPLETED | FAILED | SCHEDULED
+  scheduledAt   DateTime?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  // Stats: { sent: N, delivered: N, read: N, failed: N, replied: N }
+  statsJson     String?
+  createdBy     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  template      WhatsappTemplate @relation(fields: [templateId], references: [id])
+  recipients    WhatsappBroadcastRecipient[]
+}
+
+model WhatsappBroadcastRecipient {
+  id            String   @id @default(cuid())
+  broadcastId   String
+  contactId     String
+  // Per-recipient status: QUEUED | SENT | DELIVERED | READ | FAILED
+  status        String   @default("QUEUED")
+  sentAt        DateTime?
+  deliveredAt   DateTime?
+  readAt        DateTime?
+  errorMessage  String?
+  createdAt     DateTime @default(now())
+
+  broadcast     WhatsappBroadcast @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  contact       WhatsappContact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([broadcastId])
+  @@index([status])
+}
+
+model WhatsappQuickReply {
+  id          String   @id @default(cuid())
+  keyword     String   @unique
+  response    String
+  // Optional: trigger automatically when customer sends message containing keyword
+  autoTrigger Boolean  @default(false)
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

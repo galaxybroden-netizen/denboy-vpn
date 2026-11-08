@@ -1,0 +1,50 @@
+[Unit]
+Description=MVMP — Realtime service (socket.io gateway)
+Documentation=file:///opt/mvmp/docs/deployment/NATIVE_UBUNTU_INSTALLATION.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=mvmp
+Group=mvmp
+WorkingDirectory=/opt/mvmp/mini-services/realtime-service
+EnvironmentFile=/etc/mvmp/app.env
+Environment=NODE_ENV=production
+
+ExecStart=/usr/local/bin/bun /opt/mvmp/mini-services/realtime-service/index.ts
+
+# Realtime service has its own SIGTERM/SIGINT handlers
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+MemoryHigh=256M
+MemoryMax=384M
+LimitNOFILE=65536
+TasksMax=128
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/mvmp /var/log/mvmp /var/run/mvmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mvmp-realtime
+
+[Install]
+WantedBy=multi-user.target

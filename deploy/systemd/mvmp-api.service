@@ -1,0 +1,58 @@
+[Unit]
+Description=MVMP — Next.js API (standalone)
+Documentation=file:///opt/mvmp/docs/deployment/NATIVE_UBUNTU_INSTALLATION.md
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+Requires=postgresql.service redis-server.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=mvmp
+Group=mvmp
+WorkingDirectory=/opt/mvmp
+EnvironmentFile=/etc/mvmp/db.env
+EnvironmentFile=/etc/mvmp/redis.env
+EnvironmentFile=/etc/mvmp/app.env
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+
+# ExecStart uses the standalone server produced by `next build`
+ExecStart=/usr/bin/node /opt/mvmp/.next/standalone/server.js
+
+# Graceful shutdown — Next.js standalone handles SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits — derived from MVMP load profile
+MemoryHigh=1G
+MemoryMax=1.5G
+LimitNOFILE=65536
+TasksMax=512
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/mvmp /var/log/mvmp /var/run/mvmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Logging → journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mvmp-api
+
+[Install]
+WantedBy=multi-user.target

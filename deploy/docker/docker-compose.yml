@@ -1,0 +1,248 @@
+# MVMP — Docker Compose (Phase 14)
+#
+# 6 services on a single internal network:
+#   - postgres   (PostgreSQL 16)
+#   - redis      (Redis 7, noeviction, AOF+RDB)
+#   - api        (Next.js standalone, port 3000)
+#   - worker     (BullMQ worker, no public port)
+#   - realtime   (socket.io gateway, ports 3003+3004)
+#   - backup     (one-shot/cron backup runner)
+#
+# Only the API's port is published to the host (127.0.0.1:3001 by default).
+# The operator is expected to put Nginx (host or another container) in front
+# of mvmp-api on port 3001 — that's where public 80/443 terminate.
+#
+# Persistent volumes:
+#   - mvmp-pgdata      (PostgreSQL data)
+#   - mvmp-redis-data  (Redis AOF + RDB)
+#   - mvmp-backups     (backup artifacts)
+#
+# Usage:
+#   cp deploy/docker/shared-production.env.example .env
+#   # edit .env with real secrets
+#   docker compose up -d
+#
+# Health checks: each service has one. View with `docker compose ps`.
+
+name: mvmp
+
+networks:
+  mvmp-net:
+    driver: bridge
+    internal: false   # needs outbound for AI provider calls + apt updates
+
+volumes:
+  mvmp-pgdata:
+    driver: local
+  mvmp-redis-data:
+    driver: local
+  mvmp-backups:
+    driver: local
+
+services:
+  # ============ PostgreSQL 16 ============
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MVMP_DB_NAME:-mvmp}
+      POSTGRES_USER: ${MVMP_DB_USER:-mvmp}
+      POSTGRES_PASSWORD: ${MVMP_DB_PASSWORD:?MVMP_DB_PASSWORD is required}
+      # Default to safe settings; can be tuned via env
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=peer"
+    volumes:
+      - mvmp-pgdata:/var/lib/postgresql/data
+      - ./deploy/docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks: [mvmp-net]
+    # NOT published — only reachable on mvmp-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MVMP_DB_USER:-mvmp} -d ${MVMP_DB_NAME:-mvmp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${MVMP_POSTGRES_MEMORY:-1G}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ============ Redis 7 ============
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--requirepass", "${MVMP_REDIS_PASSWORD:?MVMP_REDIS_PASSWORD is required}"]
+    volumes:
+      - mvmp-redis-data:/data
+      - ./deploy/docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks: [mvmp-net]
+    # NOT published — only reachable on mvmp-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${MVMP_REDIS_PASSWORD:?MVMP_REDIS_PASSWORD is required}", "--no-auth-warning", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: ${MVMP_REDIS_MEMORY:-256M}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ============ MVMP API (Next.js standalone) ============
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: mvmp-app:latest
+    restart: unless-stopped
+    command: ["bun", ".next/standalone/server.js"]
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+      NEXT_RUNTIME: nodejs
+      DATABASE_URL: postgresql://${MVMP_DB_USER:-mvmp}:${MVMP_DB_PASSWORD}@postgres:5432/${MVMP_DB_NAME:-mvmp}?schema=public
+      REDIS_URL: redis://:${MVMP_REDIS_PASSWORD}@redis:6379
+      AI_ENCRYPTION_KEY: ${AI_ENCRYPTION_KEY:?AI_ENCRYPTION_KEY is required}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      PUBLIC_URL: ${PUBLIC_URL:-https://localhost}
+      AI_CHATBOT_ENABLED: ${AI_CHATBOT_ENABLED:-true}
+      AI_EMERGENCY_SHUTDOWN: ${AI_EMERGENCY_SHUTDOWN:-false}
+      RATE_LIMIT_CHAT_PER_MIN: ${RATE_LIMIT_CHAT_PER_MIN:-20}
+      RATE_LIMIT_AI_AGENT_PER_MIN: ${RATE_LIMIT_AI_AGENT_PER_MIN:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [mvmp-net]
+    # Publish ONLY to loopback — host Nginx proxies to this
+    ports:
+      - "127.0.0.1:3001:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${MVMP_API_MEMORY:-1G}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "10"
+
+  # ============ MVMP Worker (BullMQ) ============
+  worker:
+    image: mvmp-app:latest
+    restart: unless-stopped
+    command: ["bun", "src/worker/index.ts"]
+    environment:
+      NODE_ENV: production
+      NEXT_RUNTIME: nodejs
+      DATABASE_URL: postgresql://${MVMP_DB_USER:-mvmp}:${MVMP_DB_PASSWORD}@postgres:5432/${MVMP_DB_NAME:-mvmp}?schema=public
+      REDIS_URL: redis://:${MVMP_REDIS_PASSWORD}@redis:6379
+      AI_ENCRYPTION_KEY: ${AI_ENCRYPTION_KEY:?AI_ENCRYPTION_KEY is required}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [mvmp-net]
+    # NO ports published — worker has no HTTP listener
+    healthcheck:
+      # Worker emits heartbeat to stdout every 60s.
+      # Health check just verifies the process is alive.
+      test: ["CMD-SHELL", "pgrep -f 'bun src/worker' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: ${MVMP_WORKER_MEMORY:-512M}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "10"
+
+  # ============ MVMP Realtime (socket.io) ============
+  realtime:
+    image: mvmp-app:latest
+    restart: unless-stopped
+    command: ["bun", "mini-services/realtime-service/index.ts"]
+    environment:
+      NODE_ENV: production
+      REALTIME_SOCKET_PORT: "3003"
+      REALTIME_EMIT_PORT: "3004"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [mvmp-net]
+    # Publish ONLY socket.io port to loopback — host Nginx proxies /socket.io/ to this
+    ports:
+      - "127.0.0.1:3005:3003"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3004/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${MVMP_REALTIME_MEMORY:-256M}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ============ Backup (cron-style, runs nightly) ============
+  # Not always running — invoked via `docker compose run --rm backup` or
+  # an external cron job. See deploy/docker/backup-cron for a host cron example.
+  backup:
+    image: postgres:16-alpine
+    restart: "no"
+    profiles: ["backup"]   # only starts when explicitly invoked
+    environment:
+      PGPASSWORD: ${MVMP_DB_PASSWORD}
+    volumes:
+      - mvmp-backups:/backups
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        TS=$$(date +%Y%m%d-%H%M%S)
+        OUT=/backups/$${TS}
+        mkdir -p "$$OUT"
+        pg_dump -h postgres -U ${MVMP_DB_USER:-mvmp} -d ${MVMP_DB_NAME:-mvmp} \
+          --format=custom --no-owner --no-privileges \
+          --exclude-table-data='_prisma_migrations' \
+          | gzip > "$$OUT/postgres-$${TS}.dump.gz"
+        echo "Backup complete: $$OUT"
+    networks: [mvmp-net]
+    deploy:
+      resources:
+        limits:
+          memory: 256M

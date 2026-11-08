@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# Production
+build/
+
+# Environment files — NEVER commit secrets
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Database
+db/*.db
+db/backups/
+
+# Logs
+*.log
+dev.log
+server.log
+
+# Misc
+.DS_Store
+*.pem
+*.bak
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# Sandbox / dev tools
+skills/
+agent-ctx/
+tool-results/
+sandbox/
+upload/
+
+# IDE
+.vscode/
+.idea/
+
+# Turbo
+.turbo/
+
+# Redis
+var/
+
+# Bin (sandbox-built redis)
+bin/
+
+# Scripts directory — contains seed data with credentials
+# NOT for public distribution
+scripts/
+
+# Freebuff project metadata
+.freebuff/
+
+# Deployment cron files (contain paths, no secrets but not for public repo)
+deploy/cron/
+deploy/docker/backup-cron
+
+# Documentation images (may contain screenshots with sensitive data)
+# Review before publishing individually
+docs/image/
+
+# Prisma schema backup
+prisma/schema.prisma.*.bak

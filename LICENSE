@@ -1,0 +1,17 @@
+# License
+
+This project is currently **proprietary software** with all rights reserved.
+
+DERIVED FROM:
+- Next.js (MIT License) — https://github.com/vercel/next.js
+- React (MIT License) — https://github.com/facebook/react
+- Prisma (Apache 2.0 License) — https://github.com/prisma/prisma
+- Bun (MIT License) — https://github.com/oven-sh/bun
+- And other open-source dependencies (see package.json)
+
+The above licenses apply to their respective components only.
+This project's own code and assets are not open source unless explicitly stated by the owner.
+
+---
+
+**Note:** This is a placeholder. The project owner must decide on the license before this file is finalized.

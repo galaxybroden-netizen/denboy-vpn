@@ -1,0 +1,79 @@
+# MVMP — .dockerignore (Phase 14)
+#
+# Exclude files that should not enter the Docker build context.
+# Smaller context = faster builds + smaller image.
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Dependencies (will be installed inside the container)
+node_modules
+**/node_modules
+
+# Build artifacts
+.next
+**/.next
+dist
+**/dist
+build
+**/build
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# Logs
+*.log
+dev.log
+server.log
+logs
+
+# Editor / OS files
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Sandbox-only artifacts
+Caddyfile
+sandbox
+.sandbox
+
+# Test artifacts
+coverage
+.nyc_output
+
+# Backups
+db/backups
+**/db/backups
+*.bak
+
+# Documentation (kept in repo, not needed in image)
+docs
+**/*.md
+
+# Phase 13 native deployment scripts (NOT needed inside containers —
+# the container has its own health/backup scripts via docker-compose)
+scripts/deploy/install-system-packages.sh
+scripts/deploy/install-postgresql.sh
+scripts/deploy/install-redis.sh
+scripts/deploy/setup-systemd.sh
+scripts/deploy/setup-nginx.sh
+scripts/deploy/setup-firewall.sh
+scripts/deploy/create-user.sh
+
+# Env files (secrets — never bake into image)
+.env
+.env.*
+!.env.production.example
+deploy/docker/shared-production.env.example
+
+# Phase 13 audit JSON
+scripts/deploy/_audit.json
+
+# Skills (sandbox-only)
+skills
+
+# Tool results / scratch
+tool-results
+tmp
